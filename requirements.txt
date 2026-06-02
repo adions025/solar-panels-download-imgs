@@ -1,0 +1,13 @@
+geopandas>=0.14
+shapely>=2.0
+fiona>=1.9
+pyproj>=3.6
+rasterio>=1.3
+
+# Spatial index for GeoPandas
+rtree>=1.2.0
+
+# Data & HTTP
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
