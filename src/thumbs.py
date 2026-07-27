@@ -17,7 +17,7 @@ from typing import List, Tuple
 import geopandas as gpd
 import pandas as pd
 
-from shapely.geometry import box as sbox
+from shapely.geometry import MultiPolygon, Polygon, box as sbox
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
@@ -62,6 +62,8 @@ def parse_args() -> argparse.Namespace:
                help="Province name for ATOM (e.g., 'Tarragona'). Optional but speeds lookup.")
     p.add_argument("--atom-cache", default="",
                help="Optional GPKG path to cache the ATOM download (read next runs).")
+    p.add_argument("--keep-multipart-buildings", action="store_true",
+                   help="Do not split cadastral MultiPolygon buildings into separate images.")
     p.add_argument("--debug-first", type=int, default=DEFAULT_DEBUG_FIRST,
                    help="Save RAW WMS for first N buildings per year (under OUTROOT/_debug/..).")
     p.add_argument("--limit", type=int, default=0, help="Process at most this many buildings (0=all).")
@@ -180,6 +182,38 @@ def robust_city_clip(buildings: gpd.GeoDataFrame, muni_geom: BaseGeometry) -> gp
         minx, miny, maxx, maxy = muni_geom.bounds
         candidates = buildings.cx[minx:maxx, miny:maxy]
     return candidates[candidates.geometry.intersects(muni_geom)].copy()
+
+def _polygon_parts(geom: BaseGeometry):
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, Polygon):
+        return [geom]
+    if isinstance(geom, MultiPolygon):
+        return [part for part in geom.geoms if not part.is_empty]
+    if hasattr(geom, "geoms"):
+        parts = []
+        for part in geom.geoms:
+            parts.extend(_polygon_parts(part))
+        return parts
+    return []
+
+def explode_building_parts(bld_city: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    rows = []
+    for _, row in bld_city.iterrows():
+        for part_idx, part in enumerate(_polygon_parts(row.geometry), start=1):
+            if part.is_empty:
+                continue
+            new_row = row.copy()
+            new_row.geometry = part
+            new_row["feature_part"] = part_idx
+            rows.append(new_row)
+
+    if not rows:
+        raise SystemExit("[EXPLODE ERROR] No polygonal building parts remain after exploding.")
+
+    out = gpd.GeoDataFrame(rows, crs=bld_city.crs)
+    out = out[out.geometry.notna() & ~out.geometry.is_empty].copy()
+    return out.reset_index(drop=True)
 
 def precompute_jobs(
     bld_city: gpd.GeoDataFrame, mpp: float, margin_m: float, max_side: int
@@ -312,6 +346,10 @@ def main():
     dropped = before - len(bld_city)
     print(f"[CLEAN] Dropped {dropped} anomalous records (short-lived or end<start). Remaining: {len(bld_city)}")
 
+    if not a.keep_multipart_buildings:
+        before = len(bld_city)
+        bld_city = explode_building_parts(bld_city)
+        print(f"[EXPLODE] Split polygon parts: {before} features -> {len(bld_city)} images")
 
     # Optional limit for quick tests
     if LIMIT > 0 and len(bld_city) > LIMIT:
