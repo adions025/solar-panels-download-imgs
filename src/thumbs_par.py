@@ -11,14 +11,16 @@ import os
 import sys
 import argparse
 import warnings
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 import geopandas as gpd
 import pandas as pd
 
-from shapely.geometry import box as sbox
-from shapely.ops import unary_union
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon, box as sbox
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import polygonize, unary_union
 from rasterio.errors import NotGeoreferencedWarning
 
 from icgc_old import get_municipality_gdf, territorial_getmap_rgb
@@ -48,6 +50,13 @@ from thumbs import (
 warnings.simplefilter("ignore", NotGeoreferencedWarning)
 print_lock = Lock()
 
+SUBMUNICIPAL_AOIS = {
+    "valldoreix": {
+        "cadastre_city": "Sant Cugat del Vallès",
+        "aoi_file": "result.geojson",
+    },
+}
+
 def log(msg: str) -> None:
     with print_lock:
         print(msg, flush=True)
@@ -68,8 +77,24 @@ def parse_args() -> argparse.Namespace:
                    help="Where to get buildings: local file or Cadastre ATOM download.")
     p.add_argument("--province", default=None,
                    help="Province name for ATOM (e.g., 'Tarragona'). Optional but speeds lookup.")
+    p.add_argument("--cadastre-city", default="",
+                   help="Municipality to download from Cadastre when --city is a submunicipal AOI.")
     p.add_argument("--atom-cache", default="",
                    help="Optional GPKG path to cache the ATOM download (read next runs).")
+    p.add_argument("--gt-polygons", default="",
+                   help="Optional GPKG with GT/building polygons. Uses its 'id' column for output names.")
+    p.add_argument("--gt-layer", default="",
+                   help="Layer name for --gt-polygons. Defaults to the first layer.")
+    p.add_argument("--gt-filter", choices=["all", "positive"], default="all",
+                   help="For --gt-polygons: process all rows or only rows with GT_YEAR != 0.")
+    p.add_argument("--output-prefix", default="build",
+                   help="Output filename prefix (default: build). Use 'raster' to write raster_<id>.png.")
+    p.add_argument("--omit-year-in-name", action="store_true",
+                   help="Do not append _YEAR to output filenames.")
+    p.add_argument("--ids-from-dir", nargs="*", default=[],
+                   help="Optional folder(s) with raster/build PNGs; only matching IDs will be processed.")
+    p.add_argument("--keep-multipart-buildings", action="store_true",
+                   help="Do not split cadastral MultiPolygon buildings into separate images.")
     p.add_argument("--debug-first", type=int, default=DEFAULT_DEBUG_FIRST,
                    help="Save RAW WMS for first N buildings per year (under OUTROOT/_debug/..).")
     p.add_argument("--limit", type=int, default=0, help="Process at most this many buildings (0=all).")
@@ -77,8 +102,10 @@ def parse_args() -> argparse.Namespace:
                    help="Field name for building start date (YYYYMMDD).")
     p.add_argument("--baja-field", default="FECHABAJA",
                    help="Field name for building end date (YYYYMMDD or 99999999 for active).")
-    p.add_argument("--aoi-mode", choices=["muni", "from-cadastre", "bbox"], default="muni",
+    p.add_argument("--aoi-mode", choices=["muni", "from-cadastre", "bbox", "file"], default="muni",
                    help="Area-of-interest source: municipality (default), union of cadastre geometries, or explicit bbox.")
+    p.add_argument("--aoi-file", default="",
+                   help="AOI boundary file (GeoJSON/Shapefile/GPKG) used with --aoi-mode=file.")
     p.add_argument("--aoi-bbox", default="",
                    help="AOI bbox as 'minx,miny,maxx,maxy' (use with --aoi-mode=bbox).")
     p.add_argument("--aoi-crs", default="EPSG:25831",
@@ -88,7 +115,268 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _city_key(city: str) -> str:
+    return re.sub(r"\s+", " ", city.strip().replace("_", " ")).casefold()
+
+
+def _safe_filename_part(value) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[^A-Za-z0-9_-]+", "_", text)
+    return text.strip("_")
+
+
+def _cadastre_feature_id(row) -> str:
+    for field in ("localId", "LOCALID", "gml_id", "GML_ID", "ID", "id"):
+        if field in row and pd.notna(row[field]):
+            value = re.sub(r"\D+", "", str(row[field]))
+            if value:
+                return value
+    return ""
+
+
+def _output_image_id(args: argparse.Namespace, row, original_id: str, idx: int, year: int) -> str:
+    if args.gt_polygons:
+        feature_id = row.get("output_base_id") or _cadastre_feature_id(row)
+        name = f"{args.output_prefix}_{feature_id or idx}"
+        return name if args.omit_year_in_name else f"{name}_{year}"
+    return original_id
+
+
+def _ids_from_dirs(paths: list[str]) -> set[str]:
+    ids = set()
+    pattern = re.compile(r"^(?:build|raster)_(?P<id>.+?)(?:_\d{4})?\.png$", re.IGNORECASE)
+
+    for raw_path in paths:
+        folder = os.path.abspath(os.path.expanduser(raw_path))
+        if not os.path.isdir(folder):
+            raise SystemExit(f"[INPUT] --ids-from-dir folder not found: {raw_path}")
+
+        for name in os.listdir(folder):
+            match = pattern.match(name)
+            if not match:
+                continue
+            image_id = match.group("id")
+            ids.add(image_id.split("_", 1)[0])
+    return ids
+
+
+def _filter_by_allowed_ids(gdf: gpd.GeoDataFrame, allowed_ids: set[str]) -> gpd.GeoDataFrame:
+    if not allowed_ids:
+        return gdf
+
+    def row_id(row) -> str:
+        return str(row.get("source_feature_id") or row.get("output_base_id") or row.get("id")).split("_", 1)[0]
+
+    mask = gdf.apply(lambda row: row_id(row) in allowed_ids, axis=1)
+    return gdf.loc[mask].copy()
+
+
+def _polygon_parts(geom: BaseGeometry):
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, Polygon):
+        return [geom]
+    if isinstance(geom, MultiPolygon):
+        return [part for part in geom.geoms if not part.is_empty]
+    if hasattr(geom, "geoms"):
+        parts = []
+        for part in geom.geoms:
+            parts.extend(_polygon_parts(part))
+        return parts
+    return []
+
+
+def _explode_building_parts(
+    bld_city: gpd.GeoDataFrame,
+    clip_geom: BaseGeometry | None = None,
+    label: str = "AOI",
+) -> gpd.GeoDataFrame:
+    rows = []
+    id_counts: dict[str, int] = {}
+
+    for fallback_idx, (_, row) in enumerate(bld_city.iterrows(), start=1):
+        source_id = _cadastre_feature_id(row)
+        geom = row.geometry.intersection(clip_geom) if clip_geom is not None else row.geometry
+        for part in _polygon_parts(geom):
+            if part.is_empty:
+                continue
+            base_id = source_id or str(fallback_idx)
+            id_counts[base_id] = id_counts.get(base_id, 0) + 1
+
+            new_row = row.copy()
+            new_row.geometry = part
+            new_row["source_feature_id"] = source_id
+            new_row["feature_part"] = id_counts[base_id]
+            new_row["output_base_id"] = f"{base_id}_{id_counts[base_id]}"
+            rows.append(new_row)
+
+    if not rows:
+        raise SystemExit(f"[{label}] No polygonal building parts remain after clipping/exploding.")
+
+    out = gpd.GeoDataFrame(rows, crs=bld_city.crs)
+    out = out[out.geometry.notna() & ~out.geometry.is_empty].copy()
+    return out.reset_index(drop=True)
+
+
+def write_output_id_building_index(bld_city: gpd.GeoDataFrame, outdir: str):
+    out_csv = os.path.join(outdir, "building_index.csv")
+    out_gpkg = os.path.join(outdir, "building_index.gpkg")
+    rows = []
+    for _, row in bld_city.iterrows():
+        gid = str(row.get("output_base_id") or row.get("id"))
+        c = row.geometry.centroid
+        rows.append({
+            "id": gid,
+            "area_m2": float(row.geometry.area),
+            "centroid_e": float(c.x),
+            "centroid_n": float(c.y),
+        })
+    os.makedirs(outdir, exist_ok=True)
+    pd.DataFrame(rows).drop_duplicates("id").to_csv(out_csv, index=False)
+
+    g = bld_city.copy()
+    g["id"] = g["output_base_id"].astype(str)
+    g[["id", "geometry"]].to_file(out_gpkg, layer="buildings", driver="GPKG")
+    log(f"[INDEX] wrote {out_csv} and {out_gpkg}")
+
+
+def _find_aoi_file(path: str) -> str:
+    candidates = [
+        path,
+        os.path.join(os.getcwd(), path),
+        os.path.join(os.path.dirname(os.getcwd()), path),
+        os.path.join(os.path.dirname(__file__), path),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), path),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    raise SystemExit(f"[INPUT] --aoi-file not found: {path}")
+
+
+def _find_existing_file(path: str) -> str:
+    candidates = [
+        path,
+        os.path.join(os.getcwd(), path),
+        os.path.join(os.path.dirname(os.getcwd()), path),
+        os.path.join(os.path.dirname(__file__), path),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), path),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return ""
+
+
+def _line_to_polygon(geom: BaseGeometry):
+    if isinstance(geom, LineString):
+        coords = list(geom.coords)
+        if len(coords) < 3:
+            return geom
+        if coords[0] != coords[-1]:
+            coords.append(coords[0])
+        poly = Polygon(coords)
+        return poly.buffer(0) if not poly.is_valid else poly
+    if isinstance(geom, MultiLineString):
+        polygons = []
+        closed_lines = []
+        for line in geom.geoms:
+            line_poly = _line_to_polygon(line)
+            if isinstance(line_poly, (Polygon, MultiPolygon)):
+                polygons.append(line_poly)
+            else:
+                closed_lines.append(line)
+        if polygons:
+            return unary_union(polygons).buffer(0)
+        polygons = list(polygonize(unary_union(closed_lines)))
+        if polygons:
+            return unary_union(polygons).buffer(0)
+    return geom
+
+
+def _to_polygonal_aoi(gdf: gpd.GeoDataFrame):
+    geoms = [_line_to_polygon(geom) for geom in gdf.geometry if geom is not None and not geom.is_empty]
+    polygonal = [
+        geom.buffer(0) for geom in geoms
+        if isinstance(geom, (Polygon, MultiPolygon)) and not geom.is_empty
+    ]
+    polygonal = [geom for geom in polygonal if geom.is_valid and not geom.is_empty]
+    if polygonal:
+        return unary_union(polygonal).buffer(0)
+
+    lines = [
+        geom for geom in geoms
+        if isinstance(geom, (LineString, MultiLineString)) and not geom.is_empty
+    ]
+    polygons = list(polygonize(unary_union(lines))) if lines else []
+    if polygons:
+        return unary_union(polygons).buffer(0)
+    raise SystemExit("[AOI:file] Boundary file does not contain polygonal or closed line geometry.")
+
+
+def load_aoi_file(path: str):
+    aoi_path = _find_aoi_file(path)
+    gdf = gpd.read_file(aoi_path)
+    if gdf.crs is None:
+        raise SystemExit(f"[AOI:file] File has no CRS: {aoi_path}")
+    gdf = ensure_epsg25831(gdf)
+    return _to_polygonal_aoi(gdf), aoi_path
+
+
+def apply_submunicipal_defaults(a: argparse.Namespace) -> argparse.Namespace:
+    defaults = SUBMUNICIPAL_AOIS.get(_city_key(a.city))
+    if not defaults:
+        return a
+
+    if not a.cadastre_city:
+        a.cadastre_city = defaults["cadastre_city"]
+    if a.aoi_mode == "muni" and not a.aoi_file:
+        a.aoi_mode = "file"
+        a.aoi_file = defaults["aoi_file"]
+    return a
+
+
+def load_gt_polygons(a: argparse.Namespace) -> gpd.GeoDataFrame:
+    import fiona
+
+    gt_path = _find_existing_file(a.gt_polygons)
+    if not gt_path:
+        raise SystemExit(f"[INPUT] --gt-polygons file not found: {a.gt_polygons}")
+
+    layer = a.gt_layer or fiona.listlayers(gt_path)[0]
+    gdf = ensure_epsg25831(gpd.read_file(gt_path, layer=layer))
+    if "id" not in gdf.columns:
+        raise SystemExit(f"[GT] Layer '{layer}' in {gt_path} has no 'id' column.")
+
+    gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty].copy()
+    rows = []
+    for _, row in gdf.iterrows():
+        base_id = re.sub(r"\D+", "", str(row["id"]))
+        if not base_id:
+            continue
+
+        parts = _polygon_parts(row.geometry)
+        if not parts:
+            continue
+
+        for part_idx, part in enumerate(parts, start=1):
+            new_row = row.copy()
+            new_row.geometry = part
+            new_row["source_feature_id"] = base_id
+            new_row["feature_part"] = part_idx
+            new_row["output_base_id"] = base_id if len(parts) == 1 else f"{base_id}_{part_idx}"
+            rows.append(new_row)
+
+    out = gpd.GeoDataFrame(rows, crs=gdf.crs)
+    log(f"[GT] Loaded {len(gdf)} rows from {gt_path} layer '{layer}'")
+    log(f"[GT] Polygon parts after multipart explode: {len(out)}")
+    return out.reset_index(drop=True)
+
+
 def load_buildings(a: argparse.Namespace, city: str) -> gpd.GeoDataFrame:
+    if a.gt_polygons:
+        return load_gt_polygons(a)
+
     if a.cadastre_source == "file":
         cad = a.cadastre
         if not cad or not os.path.isfile(cad):
@@ -142,6 +430,10 @@ def resolve_aoi(a: argparse.Namespace, city: str, bld: gpd.GeoDataFrame):
         bbox = _parse_bbox(a.aoi_bbox)
         aoi = ensure_epsg25831(gpd.GeoDataFrame(geometry=[sbox(*bbox)], crs=a.aoi_crs))
         return aoi.geometry.iloc[0], "custom-bbox"
+    if a.aoi_mode == "file":
+        if not a.aoi_file:
+            raise SystemExit("--aoi-file is required when --aoi-mode=file")
+        return load_aoi_file(a.aoi_file)
     raise SystemExit("Unknown --aoi-mode")
 
 
@@ -153,14 +445,25 @@ def process_year(
     bld_all_len: int,
     args: argparse.Namespace,
 ):
-    bld_year = filter_by_cadastre_year(
-        bld_city, year, alta_field=args.alta_field, baja_field=args.baja_field
-    )
+    if args.gt_polygons:
+        gt_col = f"GT_{year}"
+        if args.gt_filter == "positive":
+            if gt_col not in bld_city.columns:
+                raise SystemExit(f"[GT] --gt-filter=positive requires column '{gt_col}'.")
+            bld_year = bld_city.loc[bld_city[gt_col].fillna(0) != 0].copy()
+            log(f"[{year}] GT polygons with {gt_col} != 0: {len(bld_year)}")
+        else:
+            bld_year = bld_city.copy()
+    else:
+        bld_year = filter_by_cadastre_year(
+            bld_city, year, alta_field=args.alta_field, baja_field=args.baja_field
+        )
     if bld_year.empty:
         log(f"[{year}] No active buildings for this year (after FECHAALTA/FECHABAJA filter). Skipping.")
         return
 
-    precomp = precompute_jobs(bld_year, args.mpp, args.margin, max_side=max(MAX_W, MAX_H))
+    bld_jobs = bld_year.reset_index(drop=True)
+    precomp = precompute_jobs(bld_jobs, args.mpp, args.margin, max_side=max(MAX_W, MAX_H))
     log(f"[{year}] Active buildings: {len(precomp)} of {bld_all_len} total in city")
 
     out_dir = os.path.join(city_root, str(year))
@@ -173,41 +476,44 @@ def process_year(
     stars_total = 20
     stars_printed = 0
     qc_rows = []
-    for idx, (bid, geom, bbox, width, height) in enumerate(precomp, start=1):
+    for idx, (job, (_, row)) in enumerate(zip(precomp, bld_jobs.iterrows()), start=1):
+        bid, geom, bbox, width, height = job
+        row_data = row.to_dict()
+        out_id = _output_image_id(args, row_data, bid, idx, year)
         should_have = (idx * stars_total) // total
         while stars_printed < should_have:
             log(f"[{year}] *")
             stars_printed += 1
         if not sbox(*bbox).intersects(geom):
-            log(f"[{year}] [BBOX WARN] no overlap; id={bid} bbox={bbox}")
+            log(f"[{year}] [BBOX WARN] no overlap; id={out_id} bbox={bbox}")
 
         try:
             ds, arr = territorial_getmap_rgb(bbox, width, height, year)
         except Exception as e:  # noqa: BLE001
-            log(f"[{year}] [WMS WARN] id={bid}: {e}")
+            log(f"[{year}] [WMS WARN] id={out_id}: {e}")
             continue
 
         if saved_raw < args.debug_first:
-            raw_png = os.path.join(raw_dir, f"{bid}_raw.png")
+            raw_png = os.path.join(raw_dir, f"{out_id}_raw.png")
             save_png_array(raw_png, arr)
             saved_raw += 1
             log(f"[{year}] [DEBUG] RAW min/max={arr.min()}/{arr.max()} → {raw_png}")
 
         cov, rmin, rmax, rstd = qc_metrics(arr, geom, ds.transform)
-        masked = white_outside_polygon(arr, geom, ds.transform)
+        out_arr = white_outside_polygon(arr, geom, ds.transform)
 
         if not saved_any:
             os.makedirs(out_dir, exist_ok=True)
 
-        out_png = os.path.join(out_dir, f"{bid}.png")
+        out_png = os.path.join(out_dir, f"{out_id}.png")
         try:
-            save_png_array(out_png, masked)
+            save_png_array(out_png, out_arr)
             saved_any = True
         except Exception as e:  # noqa: BLE001
-            log(f"[{year}] [WRITE WARN] id={bid}: {e}")
+            log(f"[{year}] [WRITE WARN] id={out_id}: {e}")
 
         qc_rows.append({
-            "id": bid,
+            "id": out_id,
             "year": year,
             "mask_coverage": cov,
             "raw_min": rmin,
@@ -223,13 +529,19 @@ def process_year(
 
 
 def main():
-    a = parse_args()
+    a = apply_submunicipal_defaults(parse_args())
     CITY = a.city
+    CADASTRE_CITY = a.cadastre_city or CITY
     YEAR_INI = a.year_ini
     YEAR_END = a.year_end
 
-    bld = load_buildings(a, CITY)
-    bld = clean_cadastre_records(bld, alta_field=a.alta_field, baja_field=a.baja_field)
+    if a.gt_polygons:
+        log(f"[GT] Using GT polygons for city/AOI '{CITY}'")
+    elif CADASTRE_CITY != CITY:
+        log(f"[CADASTRE] Using municipality '{CADASTRE_CITY}' for city/AOI '{CITY}'")
+    bld = load_buildings(a, CADASTRE_CITY)
+    if not a.gt_polygons:
+        bld = clean_cadastre_records(bld, alta_field=a.alta_field, baja_field=a.baja_field)
 
     aoi_geom, aoi_label = resolve_aoi(a, CITY, bld)
     area_km2 = round(aoi_geom.area / 1e6, 3)
@@ -241,13 +553,31 @@ def main():
     if len(bld_city) == 0:
         raise SystemExit("[CLIP ERROR] No buildings intersect the AOI.")
 
+    city_key = _city_key(CITY)
+    if not a.gt_polygons and not a.keep_multipart_buildings:
+        before = len(bld_city)
+        clip_geom = aoi_geom if city_key == "valldoreix" else None
+        bld_city = _explode_building_parts(bld_city, clip_geom=clip_geom, label=CITY)
+        log(f"[{CITY}] Exploded polygon parts: {before} features -> {len(bld_city)} images")
+
+    if a.ids_from_dir:
+        allowed_ids = _ids_from_dirs(a.ids_from_dir)
+        before = len(bld_city)
+        bld_city = _filter_by_allowed_ids(bld_city, allowed_ids)
+        log(f"[IDS] Loaded {len(allowed_ids)} IDs from folder(s); selected {len(bld_city)} of {before} geometries")
+        if len(bld_city) == 0:
+            raise SystemExit("[IDS] No geometries match the IDs from --ids-from-dir.")
+
     if a.limit > 0 and len(bld_city) > a.limit:
         bld_city = bld_city.head(a.limit).copy()
         log(f"[LIMIT] Limiting to first {a.limit} buildings for this run.")
 
     city_root = os.path.join(a.outroot, CITY.replace(" ", "_"))
     debug_root = os.path.join(a.outroot, "_debug", CITY.replace(" ", "_"))
-    write_building_index(bld_city, city_root)
+    if a.gt_polygons:
+        write_output_id_building_index(bld_city, city_root)
+    else:
+        write_building_index(bld_city, city_root)
 
     years = list(range(YEAR_INI, YEAR_END + 1))
     max_workers = max(1, min(a.max_workers, len(years)))
